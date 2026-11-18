@@ -1,8 +1,9 @@
 
 from airflow.sdk import dag, task
+from airflow.exceptions import AirflowFailException
 from datetime import datetime, timedelta
 from pathlib import Path
-from bs4 import BeautifulSoup
+from io import StringIO
 import requests
 import pandas as pd
 import os
@@ -18,7 +19,7 @@ import os
         "retries": 2,
         "retry_delay": timedelta(minutes=5)
     },
-    tags=["banking", "web-scraping", "etl"]
+    tags=["banking", "finance", "etl"]
 )
 def bank_scraping_pipeline():
 
@@ -26,55 +27,63 @@ def bank_scraping_pipeline():
     def extract():
 
         url = (
-            "https://www.bankofengland.co.uk"
-            "/boeapps/database/Bank-Rate.asp"
+            "https://www.bankofengland.co.uk/boeapps/"
+            "database/_iadb-fromshowcolumns.asp"
         )
 
-        response = requests.get(url, timeout=30)
+        params = {
+            "csv.x": "yes",
+            "Datefrom": "01/Jan/2020",
+            "Dateto": "now",
+            "SeriesCodes": "IUDBEDR",
+            "CSVF": "TN",
+            "UsingCodes": "Y",
+            "VPD": "Y",
+            "VFD": "N"
+        }
+
+        headers = {
+            "User-Agent": "Airflow-Banking-ETL/1.0",
+            "Accept": "text/csv"
+        }
+
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=60
+        )
+
+        if response.status_code == 403:
+            raise AirflowFailException(
+                "Access forbidden by data provider"
+            )
+
         response.raise_for_status()
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        df = pd.read_csv(StringIO(response.text))
 
-        records = []
+        print(f"Extracted {len(df)} records")
 
-        for row in soup.find_all("tr"):
-
-            columns = row.find_all("td")
-
-            if len(columns) == 2:
-
-                date = columns[0].get_text(strip=True)
-                rate = columns[1].get_text(strip=True)
-
-                records.append({
-                    "date": date,
-                    "interest_rate": rate
-                })
-
-        if not records:
-            raise ValueError("No banking data extracted")
-
-        print(f"Extracted {len(records)} records")
-
-        return records
+        return df.to_json(orient="records")
 
     @task
-    def transform(records):
+    def transform(raw_data):
 
-        df = pd.DataFrame(records)
+        df = pd.read_json(StringIO(raw_data))
+
+        df.columns = df.columns.str.strip()
+
+        df = df.rename(columns={
+            "DATE": "date",
+            "IUDBEDR": "interest_rate"
+        })
 
         df["date"] = pd.to_datetime(
             df["date"],
-            format="%d %b %y",
+            format="mixed",
+            dayfirst=True,
             errors="coerce"
-        )
-
-        # Correct historical two-digit years
-        future = df["date"] > pd.Timestamp.today()
-
-        df.loc[future, "date"] = (
-            df.loc[future, "date"]
-            - pd.DateOffset(years=100)
         )
 
         df["interest_rate"] = pd.to_numeric(
@@ -87,10 +96,7 @@ def bank_scraping_pipeline():
         df = df.sort_values("date", ascending=False)
 
         df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-
         df["bank"] = "Bank of England"
-
-        print(df.head())
 
         return df.to_dict(orient="records")
 
@@ -99,11 +105,11 @@ def bank_scraping_pipeline():
 
         df = pd.DataFrame(records)
 
-        assert not df.empty, "No banking records"
-        assert not df.isnull().any().any()
+        assert not df.empty, "No data found"
         assert df["date"].is_unique
+        assert not df.isnull().any().any()
 
-        print("Data quality validation successful")
+        print("Data validation successful")
 
         return records
 
@@ -112,18 +118,14 @@ def bank_scraping_pipeline():
 
         df = pd.DataFrame(records)
 
-        output_dir = Path(
-            os.environ["AIRFLOW_HOME"]
-        ) / "output"
-
+        output_dir = Path(os.environ["AIRFLOW_HOME"]) / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         file_path = output_dir / "bank_interest_rates.csv"
 
         df.to_csv(file_path, index=False)
 
-        print(f"Banking data saved to {file_path}")
-        print(f"Total records: {len(df)}")
+        print(f"Saved {len(df)} records to {file_path}")
 
     raw_data = extract()
     clean_data = transform(raw_data)
