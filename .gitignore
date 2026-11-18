@@ -1,0 +1,30 @@
+
+# Virtual environments
+airflow_env/
+airflow_env312/
+.venv/
+venv/
+
+# Airflow runtime files
+airflow/*
+!airflow/dags/
+!airflow/dags/**
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Credentials
+.env
+.env.*
+*.generated
+*.pem
+
+# Database and logs
+*.db
+*.db-*
+*.log
+
+# IDE settings
+.vscode/
+.idea/
